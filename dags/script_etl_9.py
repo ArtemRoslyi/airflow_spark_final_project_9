@@ -1,15 +1,22 @@
+from airflow import DAG
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+
 from pyspark.sql import SparkSession
 from pyspark.sql.types import IntegerType, DoubleType, ShortType, DateType, BooleanType
-import spark.sql.functions as f
+import pyspark.sql.functions as f
 import logging
 
 logger = logging.getLogger(__name__)
 
 # 9. Настройте соединение с PostgreSQL из кода, но из PySpark. 
 # (обязательно сделать это нужно в Airflow)
-def conection_postgre(df=None, table_name='test', db_name='test'):
+
+def conection_postgre(spark=None, df=None, table_name='test', db_name='test'):
     try:
-        url = f'jdbc:postgresql://localhost:5432/{db_name}'
+        url = f'jdbc:postgresql://postgres_user:5432/{db_name}'
         properties = {
             'user': 'user',
             'password': 'password',
@@ -33,9 +40,10 @@ def conection_postgre(df=None, table_name='test', db_name='test'):
         
     except Exception as e:
         logger.exception(f'Ошибка соединения с postgre: {e}')
+        raise
 
-
-def spark_job(file_path):
+@task
+def task_spark(file_path_1, file_path_2, file_path_3):
 
     try:
         # 1. Загрузите файл данных в DataFrame PySpark. 
@@ -52,22 +60,22 @@ def spark_job(file_path):
         airlines_raw_df = (
             spark
             .read
-            .options('header', True)
-            .csv('/airflow_spark_data/airlines.csv')
+            .option('header', True)
+            .csv(file_path_1)
         )
 
         airports_raw_df = (
             spark
             .read
-            .options('header', True)            
-            .csv('/airflow_spark_data/airports.csv')
+            .option('header', True)            
+            .csv(file_path_2)
         )
 
         flights_pak_raw_df = (
             spark
             .read
-            .options('header', True)            
-            .csv('/airflow_spark_data/flights_pak.csv')
+            .option('header', True)            
+            .csv(file_path_3)
         )
 
         logger.info(f'Количество строк в airlines_raw_df: {airlines_raw_df.count()}')   
@@ -76,20 +84,14 @@ def spark_job(file_path):
 
         # 2. Убедитесь, что данные корректно прочитаны 
         # (правильный формат, отсутствие пустых строк).
-        logger.info('Первые 3 строки в airlines_raw_df:')
-        airlines_raw_df.show(3, truncate=False)
-        logger.info('Схема данных в airlines_raw_df:')
-        airlines_raw_df.printSchema()       
+        logger.info('Первые 2 строки в airlines_raw_df:\n' + airlines_raw_df._jdf.showString(2, 0, False))
+        logger.info('Схема данных в airlines_raw_df:\n' + airlines_raw_df._jdf.schema().treeString()) 
         
-        logger.info('Первые 3 строки в airports_row_df:')
-        airports_raw_df.show(3, truncate=False)
-        logger.info('Схема данных в airports_row_df:')
-        airports_raw_df.printSchema()
+        logger.info('Первые 2 строки в airports_row_df:\n' + airports_raw_df._jdf.showString(2, 0, False))
+        logger.info('Схема данных в airports_row_df:\n' + airports_raw_df._jdf.schema().treeString())
 
-        logger.info('Первые 3 строки в flights_pak_row_df:')
-        flights_pak_raw_df.show(3, truncate=False)
-        logger.info('Схема данных в flights_pak_row_df:')
-        flights_pak_raw_df.printSchema()
+        logger.info('Первые 2 строки в flights_pak_row_df:\n' + flights_pak_raw_df._jdf.showString(2, 0, False))
+        logger.info('Схема данных в flights_pak_row_df:\n' + flights_pak_raw_df._jdf.schema().treeString())
 
         # 3. Преобразуйте текстовые и числовые поля в 
         # соответствующие типы данных (например, дата, число).
@@ -123,19 +125,25 @@ def spark_job(file_path):
         # 4. Найдите топ-5 авиалиний с наибольшей средней задержкой.
         max_avg_delay_airlines_df = (
             flights_pak_df
+            .filter(f.col('ARRIVAL_DELAY') > 0)
             .groupBy('AIRLINE')
-            .agg(f.avg(f.col('ARRIVAL_DELAY')).alias('AVG_ARRIVAL_DELAY'))
+            .agg(
+                f.round(f.avg(f.col('ARRIVAL_DELAY')), 2).alias('AVG_ARRIVAL_DELAY_MINUTES')
+                ) 
             .alias('1_df').join(
                 airlines_df.alias('2_df'),
                 on=f.col('1_df.AIRLINE') == f.col('2_df.IATA_CODE'),
                 how='inner'
             )
-            .orderBy(f.desc('1_df.AVG_ARRIVAL_DELAY'))
-            .select('2_df.AIRLINE', '1_df.AVG_ARRIVAL_DELAY')
+            .select('2_df.AIRLINE', '1_df.AVG_ARRIVAL_DELAY_MINUTES')
+            .orderBy(f.desc('1_df.AVG_ARRIVAL_DELAY_MINUTES'))
             .limit(5)
         )
 
-        conection_postgre(max_avg_delay_airlines_df, 'max_avg_delay_airlines_df')
+        conection_postgre(
+            df=max_avg_delay_airlines_df, 
+            table_name='max_avg_delay_airlines_df'
+        )
 
         # 5. Вычислите процент отмененных рейсов для каждого аэропорта.
         percent_cancelld_flights_airport_df = (
@@ -157,11 +165,14 @@ def spark_job(file_path):
                 on=f.col('1_df.ORIGIN_AIRPORT') == f.col('2_df.IATA_CODE'),
                 how='inner'
             )
-            .orderBy('1_df.PERCENT_CANCELLED_FLIGHTS')
+            .orderBy(f.desc('1_df.PERCENT_CANCELLED_FLIGHTS'))
             .select('2_df.Airport', '2_df.City', '1_df.PERCENT_CANCELLED_FLIGHTS')
         )
 
-        conection_postgre(percent_cancelld_flights_airport_df, 'percent_cancelld_flights_airport_df')
+        conection_postgre(
+            df=percent_cancelld_flights_airport_df, 
+            table_name='percent_cancelld_flights_airport_df'
+        )
 
         # 6. Определите, какое время суток (утро, день, вечер, ночь) 
         # чаще всего связано с задержками рейсов.
@@ -179,7 +190,10 @@ def spark_job(file_path):
             .limit(1)
         )
 
-        conection_postgre(delay_times_of_day_df, 'delay_times_of_day_df')
+        conection_postgre(
+            df=delay_times_of_day_df, 
+            table_name='delay_times_of_day_df'
+        )
             
         # 7. Добавьте в данные о полетах новые столбцы, рассчитанные 
         # на основе существующих данных:
@@ -197,20 +211,26 @@ def spark_job(file_path):
                  .when(f.col('ARRIVAL_HOUR').between(18, 21), 'Вечер: 18-22')
                  .otherwise('Ночь: 22-6')
             )
-            orderBy('DATE')
-            limit(10000)
+            .orderBy('DATE')
+            .limit(10000)
         )
 
         # 10. Загрузите только 10.000 строк из DataFrame в таблицу в PostgreSQL. 
         # (обязательно сделать это нужно в Airflow)
-        conection_postgre(flights_pak_add_column_df, 'flights_pak_add_column_df')
+        conection_postgre(
+            df=flights_pak_add_column_df, 
+            table_name='flights_pak_add_column_df'
+        )
 
         # 11. Выполните SQL скрипт в Python-PySpark скрипте, 
         # который выведет компанию - общее время полетов ее самолетов.
-        pg_flights_pak_add_column_df = conection_postgre('flights_pak_add_column_df')
+        pg_flights_pak_add_column_df = conection_postgre(
+            spark=spark, 
+            table_name='flights_pak_add_column_df'
+        )
         pg_flights_pak_add_column_df.createOrReplaceTempView('pg_flights_pak_add_column_view')
         airlines_df.createOrReplaceTempView('airlines_view')
-        spark.sql(
+        result_sql_df = spark.sql(
             '''
             select 
                 view_2.AIRLINE, 
@@ -230,10 +250,45 @@ def spark_job(file_path):
             '''
         )
 
-
+        logger.info('Первые 5 строк SQL-запроса:\n' + result_sql_df._jdf.showString(5, 0, False))
 
     except Exception as e:
         logger.exception(f'Ошибка pyspark задачи: {e}')
+        raise
     finally:
         if spark:
             spark.stop()
+
+@task
+def task_start():
+    logger.info('Start')
+
+@task
+def task_end():
+    logger.info('end')
+
+with DAG(
+    dag_id='main',
+    default_args={
+        'owner': 'airflow',
+        'depends_on_past': False,
+        'start_date': days_ago(1),
+    },
+    description='main',
+    schedule_interval=None,
+) as dag:
+    
+    start_task = task_start()
+    end_task = task_end()
+
+    spark_task = task_spark(
+        file_path_1='/airflow_spark_data/airlines.csv',                
+        file_path_2='/airflow_spark_data/airports.csv', 
+        file_path_3='/airflow_spark_data/flights_pak.csv'
+    )
+
+    (
+        start_task 
+        >> spark_task
+        >> end_task
+    )
